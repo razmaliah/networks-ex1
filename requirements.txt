@@ -1,3 +1,6 @@
-streamlit
+streamlit>=1.52
 pandas
+plotly
 python-dotenv
+anthropic
+pytest
