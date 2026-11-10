@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -308,18 +309,26 @@ def render_ai(analysis: CaptureAnalysis) -> None:
     question = st.text_area("השאלה שלך", placeholder="למשל: לאילו אתרים נשלחו בקשות HTTP, ומה היה זמן התגובה הארוך ביותר?",
                             key="ai_question")
     if st.button("שלח שאלה", type="primary", disabled=not question.strip() or not api_key):
+        status = st.status(f"שולח ל-{settings['label']}...", expanded=True)
+        started = time.monotonic()
+
+        def show_progress(text: str) -> None:
+            status.write(f"`{time.monotonic() - started:5.1f}s`  {text}")
+
         try:
-            with st.spinner(f"שולח ל-{settings['label']}..."):
-                answer = ai_helper.ask(question.strip(), analysis, provider=provider, api_key=api_key, model=model)
+            answer = ai_helper.ask(question.strip(), analysis, provider=provider, api_key=api_key, model=model,
+                                   on_progress=show_progress)
+            status.update(label=f"התקבלה תשובה אחרי {answer.elapsed_s:.1f} שניות", state="complete", expanded=False)
             st.session_state.setdefault("ai_history", []).insert(0, (analysis.file_name, question.strip(), answer))
         except Exception as error:  # network, authentication or quota errors are shown, not raised
+            status.update(label=f"נכשל אחרי {time.monotonic() - started:.1f} שניות", state="error", expanded=True)
             st.error(f"השאלה נכשלה: {error}")
 
     for file_name, asked, answer in st.session_state.get("ai_history", []):
         if file_name != analysis.file_name:
             continue
         with st.container(border=True):
-            st.caption(f"{answer.provider} · {answer.model}")
+            st.caption(f"{answer.provider} · {answer.model} · {answer.elapsed_s:.1f} s")
             st.markdown(f"**שאלה:** {asked}")
             st.markdown(f"**תשובה:** {answer.answer}")
             if answer.evidence:

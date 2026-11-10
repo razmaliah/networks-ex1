@@ -24,7 +24,8 @@ PROVIDERS = {
 }
 
 MAX_TRANSACTIONS = 150
-GEMINI_TIMEOUT_S = 90
+GEMINI_TIMEOUT_S = 60  # per request
+GEMINI_TOTAL_BUDGET_S = 120  # for all attempts together
 GEMINI_ATTEMPTS = 3
 RETRY_CODES = (429, 500, 503, 504)  # rate limit / temporary server errors
 MAX_ROWS = 40
@@ -53,6 +54,7 @@ class AiAnswer:
     raw_text: str = ""
     provider: str = ""
     model: str = ""
+    elapsed_s: float = 0.0
 
 
 def build_context(analysis: CaptureAnalysis) -> dict:
@@ -116,19 +118,27 @@ def default_model(provider: str) -> str:
 
 
 def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic",
-        api_key: str | None = None, model: str | None = None) -> AiAnswer:
+        api_key: str | None = None, model: str | None = None, on_progress=None) -> AiAnswer:
+    """Sends the question with the extracted data. on_progress(text) is called with status updates for the UI."""
     settings = PROVIDERS[provider]
     api_key = api_key or api_key_from_env(provider)
     if not api_key:
         raise RuntimeError(f"No API key: set {settings['env_key']} in the .env file.")
     model = model or default_model(provider)
+    progress = on_progress or (lambda _text: None)
 
     context = json.dumps(build_context(analysis), ensure_ascii=False)
     prompt = f"<capture_data>\n{context}\n</capture_data>\n\nQuestion: {question}"
-    text = _ask_gemini(prompt, api_key, model) if provider == "gemini" else _ask_claude(prompt, api_key, model)
+    progress(f"Sending {len(prompt) / 1024:,.0f} KB of extracted data to {model}...")
+    started = time.monotonic()
+    if provider == "gemini":
+        text = _ask_gemini(prompt, api_key, model, progress)
+    else:
+        text = _ask_claude(prompt, api_key, model)
 
     answer = parse_answer(text, analysis.summary.packet_count)
     answer.provider, answer.model = settings["label"], model
+    answer.elapsed_s = time.monotonic() - started
     return answer
 
 
@@ -137,41 +147,64 @@ def _ask_claude(prompt: str, api_key: str, model: str) -> str:
         import anthropic
     except ImportError as error:
         raise RuntimeError("The 'anthropic' package is not installed: pip install -r requirements.txt") from error
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key, timeout=GEMINI_TIMEOUT_S)
     response = client.messages.create(model=model, max_tokens=2000, system=SYSTEM_PROMPT,
                                       messages=[{"role": "user", "content": prompt}])
     return "".join(block.text for block in response.content if block.type == "text")
 
 
-def _ask_gemini(prompt: str, api_key: str, model: str) -> str:
+def _gemini_thinking(types, model: str):
+    """Keeps the model's hidden 'thinking' short: this task is lookup over given data, and long thinking is slow."""
+    version = _version_key(model)
+    try:
+        if version and version[0] >= 3:
+            return types.ThinkingConfig(thinking_level="low")
+        if "flash" in model:
+            return types.ThinkingConfig(thinking_budget=0)
+    except Exception:  # older SDK without these fields
+        return None
+    return None
+
+
+def _ask_gemini(prompt: str, api_key: str, model: str, progress) -> str:
     try:
         from google import genai
         from google.genai import types
     except ImportError as error:
         raise RuntimeError("The 'google-genai' package is not installed: pip install -r requirements.txt") from error
     client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_S * 1000))
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
-        response_mime_type="application/json",
-        max_output_tokens=8192,  # thinking models count their reasoning in this limit too
-    )
-    response = None
-    for attempt in range(1, GEMINI_ATTEMPTS + 1):
+
+    def make_config(thinking):
+        return types.GenerateContentConfig(system_instruction=SYSTEM_PROMPT, response_mime_type="application/json",
+                                           max_output_tokens=8192, thinking_config=thinking)
+
+    config = make_config(_gemini_thinking(types, model))
+    deadline = time.monotonic() + GEMINI_TOTAL_BUDGET_S
+    attempt = 0
+    while True:
+        attempt += 1
+        if attempt > 1:
+            progress(f"Attempt {attempt} of {GEMINI_ATTEMPTS}...")
         try:
             response = client.models.generate_content(model=model, contents=prompt, config=config)
             break
         except Exception as error:
             code = getattr(error, "code", None)
-            timed_out = "timeout" in type(error).__name__.lower() or "timed out" in str(error).lower()
-            if timed_out:
+            if "timeout" in type(error).__name__.lower() or "timed out" in str(error).lower():
                 raise RuntimeError(f"Gemini did not answer within {GEMINI_TIMEOUT_S} seconds. "
                                    "Try again or pick a lighter model (e.g. a 'flash-lite' one).") from error
+            if code == 400 and config.thinking_config is not None and "think" in str(error).lower():
+                progress("The model does not accept the thinking setting; retrying without it...")
+                config = make_config(None)  # this model rejects the setting: send the request without it
+                continue
             if code not in RETRY_CODES:
                 raise
-            if attempt == GEMINI_ATTEMPTS:
-                raise RuntimeError(f"Gemini is overloaded right now (HTTP {code}); tried {GEMINI_ATTEMPTS} times. "
+            wait = 2 ** attempt
+            if attempt >= GEMINI_ATTEMPTS or time.monotonic() + wait > deadline:
+                raise RuntimeError(f"Gemini is overloaded right now (HTTP {code}); tried {attempt} times. "
                                    "Try again in a few minutes, pick another model, or use Claude.") from error
-            time.sleep(2 ** attempt)  # 2s, 4s: give the service a moment before retrying
+            progress(f"Gemini is busy (HTTP {code}); waiting {wait} s before retrying...")
+            time.sleep(wait)
     if not response.text:
         raise RuntimeError("Gemini returned an empty answer (it may have been blocked or cut off).")
     return response.text
