@@ -15,12 +15,12 @@ from datetime import datetime
 from analysis import conversations, ip_stats, protocol_stats, relative_time, resolved_names
 from models import CaptureAnalysis
 
-# provider id -> settings
+# provider id -> settings (the first one is the default in the UI)
 PROVIDERS = {
-    "anthropic": {"label": "Claude (Anthropic)", "env_key": "ANTHROPIC_API_KEY", "env_model": "AI_MODEL",
-                  "default_model": "claude-sonnet-5-5", "key_url": "https://console.anthropic.com/settings/keys"},
     "gemini": {"label": "Gemini (Google)", "env_key": "GEMINI_API_KEY", "env_model": "GEMINI_MODEL",
                "default_model": "gemini-3.8-flash", "key_url": "https://aistudio.google.com/apikey"},
+    "anthropic": {"label": "Claude (Anthropic)", "env_key": "ANTHROPIC_API_KEY", "env_model": "AI_MODEL",
+                  "default_model": "claude-sonnet-5-5", "key_url": "https://console.anthropic.com/settings/keys"},
 }
 
 MAX_TRANSACTIONS = 150
@@ -117,7 +117,7 @@ def default_model(provider: str) -> str:
     return os.getenv(settings["env_model"]) or settings["default_model"]
 
 
-def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic", api_key: str | None = None,
+def ask(question: str, analysis: CaptureAnalysis, provider: str = "gemini", api_key: str | None = None,
         model: str | None = None, on_progress=None, history: list[tuple[str, str]] | None = None) -> AiAnswer:
     """Sends the question with the extracted data.
 
