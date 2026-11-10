@@ -3,4 +3,5 @@ pandas
 plotly
 python-dotenv
 anthropic
+google-genai
 pytest

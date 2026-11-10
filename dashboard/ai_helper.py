@@ -1,4 +1,4 @@
-"""Answers free-text questions about a capture with Claude.
+"""Answers free-text questions about a capture with an AI model (Claude or Gemini).
 
 Only data already extracted by the analysis layer is sent to the model; the PCAP file itself never is.
 """
@@ -14,7 +14,14 @@ from datetime import datetime
 from analysis import conversations, ip_stats, protocol_stats, relative_time, resolved_names
 from models import CaptureAnalysis
 
-DEFAULT_MODEL = "claude-sonnet-5-5"
+# provider id -> settings
+PROVIDERS = {
+    "anthropic": {"label": "Claude (Anthropic)", "env_key": "ANTHROPIC_API_KEY", "env_model": "AI_MODEL",
+                  "default_model": "claude-sonnet-5-5", "key_url": "https://console.anthropic.com/settings/keys"},
+    "gemini": {"label": "Gemini (Google)", "env_key": "GEMINI_API_KEY", "env_model": "GEMINI_MODEL",
+               "default_model": "gemini-2.5-flash", "key_url": "https://aistudio.google.com/apikey"},
+}
+
 MAX_TRANSACTIONS = 150
 MAX_ROWS = 40
 MAX_HEADER_VALUE = 150
@@ -38,8 +45,10 @@ class AiAnswer:
     answer: str
     evidence: list[dict] = field(default_factory=list)
     limitations: str = ""
-    invalid_frames: list[int] = field(default_factory=list)  # cited frames that do not exist in the capture
+    invalid_frames: list = field(default_factory=list)  # cited frames that do not exist in the capture
     raw_text: str = ""
+    provider: str = ""
+    model: str = ""
 
 
 def build_context(analysis: CaptureAnalysis) -> dict:
@@ -93,29 +102,91 @@ def build_context(analysis: CaptureAnalysis) -> dict:
     }
 
 
-def ask(question: str, analysis: CaptureAnalysis, api_key: str | None = None, model: str | None = None) -> AiAnswer:
+def api_key_from_env(provider: str) -> str | None:
+    return os.getenv(PROVIDERS[provider]["env_key"]) or None
+
+
+def default_model(provider: str) -> str:
+    settings = PROVIDERS[provider]
+    return os.getenv(settings["env_model"]) or settings["default_model"]
+
+
+def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic",
+        api_key: str | None = None, model: str | None = None) -> AiAnswer:
+    settings = PROVIDERS[provider]
+    api_key = api_key or api_key_from_env(provider)
+    if not api_key:
+        raise RuntimeError(f"No API key: set {settings['env_key']} in the .env file.")
+    model = model or default_model(provider)
+
+    context = json.dumps(build_context(analysis), ensure_ascii=False)
+    prompt = f"<capture_data>\n{context}\n</capture_data>\n\nQuestion: {question}"
+    text = _ask_gemini(prompt, api_key, model) if provider == "gemini" else _ask_claude(prompt, api_key, model)
+
+    answer = parse_answer(text, analysis.summary.packet_count)
+    answer.provider, answer.model = settings["label"], model
+    return answer
+
+
+def _ask_claude(prompt: str, api_key: str, model: str) -> str:
     try:
         import anthropic
     except ImportError as error:
         raise RuntimeError("The 'anthropic' package is not installed: pip install -r requirements.txt") from error
-
-    api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise RuntimeError("No API key: set ANTHROPIC_API_KEY in the .env file.")
-
-    context = build_context(analysis)
     client = anthropic.Anthropic(api_key=api_key)
-    response = client.messages.create(
-        model=model or os.getenv("AI_MODEL") or DEFAULT_MODEL,
-        max_tokens=2000,
-        system=SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f"<capture_data>\n{json.dumps(context, ensure_ascii=False)}\n</capture_data>\n\nQuestion: {question}",
-        }],
+    response = client.messages.create(model=model, max_tokens=2000, system=SYSTEM_PROMPT,
+                                      messages=[{"role": "user", "content": prompt}])
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+def _ask_gemini(prompt: str, api_key: str, model: str) -> str:
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError as error:
+        raise RuntimeError("The 'google-genai' package is not installed: pip install -r requirements.txt") from error
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            max_output_tokens=8192,  # thinking models count their reasoning in this limit too
+        ),
     )
-    text = "".join(block.text for block in response.content if block.type == "text")
-    return parse_answer(text, analysis.summary.packet_count)
+    if not response.text:
+        raise RuntimeError("Gemini returned an empty answer (it may have been blocked or cut off).")
+    return response.text
+
+
+def list_gemini_models(api_key: str) -> list[str]:
+    """Gemini models this key can use for text generation, so the user picks a real name instead of a guess."""
+    from google import genai
+
+    names = []
+    for model in genai.Client(api_key=api_key).models.list():
+        actions = getattr(model, "supported_actions", None) or []
+        name = (model.name or "").removeprefix("models/")
+        if name.startswith("gemini") and (not actions or "generateContent" in actions):
+            names.append(name)
+    return sorted(names)
+
+
+def pick_gemini_default(names: list[str]) -> str | None:
+    """Prefers GEMINI_MODEL from .env, otherwise the newest stable general-purpose 'flash' model."""
+    preferred = os.getenv("GEMINI_MODEL")
+    if preferred in names:
+        return preferred
+    skip = ("lite", "image", "tts", "live", "audio", "embedding", "preview", "exp", "thinking")
+    stable_flash = [n for n in names if "flash" in n and not any(word in n for word in skip)]
+    if stable_flash:
+        return sorted(stable_flash, key=_version_key)[-1]
+    return names[-1] if names else None
+
+
+def _version_key(name: str) -> tuple:
+    return tuple(int(part) for part in re.findall(r"\d+", name))
 
 
 def parse_answer(text: str, packet_count: int) -> AiAnswer:
