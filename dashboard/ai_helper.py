@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -23,6 +24,9 @@ PROVIDERS = {
 }
 
 MAX_TRANSACTIONS = 150
+GEMINI_TIMEOUT_S = 90
+GEMINI_ATTEMPTS = 3
+RETRY_CODES = (429, 500, 503, 504)  # rate limit / temporary server errors
 MAX_ROWS = 40
 MAX_HEADER_VALUE = 150
 
@@ -145,16 +149,29 @@ def _ask_gemini(prompt: str, api_key: str, model: str) -> str:
         from google.genai import types
     except ImportError as error:
         raise RuntimeError("The 'google-genai' package is not installed: pip install -r requirements.txt") from error
-    client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-            max_output_tokens=8192,  # thinking models count their reasoning in this limit too
-        ),
+    client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_S * 1000))
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
+        max_output_tokens=8192,  # thinking models count their reasoning in this limit too
     )
+    response = None
+    for attempt in range(1, GEMINI_ATTEMPTS + 1):
+        try:
+            response = client.models.generate_content(model=model, contents=prompt, config=config)
+            break
+        except Exception as error:
+            code = getattr(error, "code", None)
+            timed_out = "timeout" in type(error).__name__.lower() or "timed out" in str(error).lower()
+            if timed_out:
+                raise RuntimeError(f"Gemini did not answer within {GEMINI_TIMEOUT_S} seconds. "
+                                   "Try again or pick a lighter model (e.g. a 'flash-lite' one).") from error
+            if code not in RETRY_CODES:
+                raise
+            if attempt == GEMINI_ATTEMPTS:
+                raise RuntimeError(f"Gemini is overloaded right now (HTTP {code}); tried {GEMINI_ATTEMPTS} times. "
+                                   "Try again in a few minutes, pick another model, or use Claude.") from error
+            time.sleep(2 ** attempt)  # 2s, 4s: give the service a moment before retrying
     if not response.text:
         raise RuntimeError("Gemini returned an empty answer (it may have been blocked or cut off).")
     return response.text

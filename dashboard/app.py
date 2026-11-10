@@ -21,8 +21,9 @@ st.set_page_config(page_title="PCAP Dashboard", page_icon="📡", layout="wide")
 st.markdown(
     """<style>
     [data-testid="stMarkdownContainer"], h1, h2, h3, .stAlert, [data-testid="stWidgetLabel"],
-    [data-testid="stMetric"], [data-baseweb="tab-list"], .stRadio, .stCheckbox {direction: rtl; text-align: right;}
+    [data-testid="stMetric"], .stRadio, .stCheckbox {direction: rtl; text-align: right;}
     code, pre {direction: ltr; text-align: left;}
+    [data-testid="stTabs"] [role="tablist"] {direction: rtl; justify-content: flex-start;}
     [data-testid="stSlider"] [data-baseweb="slider"], [data-testid="stSlider"] [data-baseweb="slider"] * {direction: ltr !important;}
     </style>""",
     unsafe_allow_html=True,
