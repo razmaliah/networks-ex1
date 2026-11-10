@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from datetime import datetime
 from pathlib import Path
 
@@ -24,6 +23,7 @@ st.markdown(
     [data-testid="stMarkdownContainer"], h1, h2, h3, .stAlert, [data-testid="stWidgetLabel"],
     [data-testid="stMetric"], [data-baseweb="tab-list"], .stRadio, .stCheckbox {direction: rtl; text-align: right;}
     code, pre {direction: ltr; text-align: left;}
+    [data-testid="stSlider"] [data-baseweb="slider"], [data-testid="stSlider"] [data-baseweb="slider"] * {direction: ltr !important;}
     </style>""",
     unsafe_allow_html=True,
 )
@@ -61,13 +61,15 @@ def render_summary(analysis: CaptureAnalysis) -> None:
     left, right = st.columns([1, 3])
     with left:
         mode = st.radio("פילוח לפי", ["הכל", "מקור (Source)", "יעד (Destination)"], key="ip_mode")
+        version_label = st.radio("גרסת IP", ["IPv4 + IPv6", "IPv4 בלבד", "IPv6 בלבד"], key="ip_version")
         top_n = st.slider("כמה כתובות להציג", 5, 30, 10, key="ip_top")
         metric = st.radio("מדד", ["חבילות", "בתים"], horizontal=True, key="ip_metric")
     direction = {"הכל": "both", "מקור (Source)": "src", "יעד (Destination)": "dst"}[mode]
-    ips = pd.DataFrame(ip_stats(analysis.packets, direction))
+    version = {"IPv4 + IPv6": None, "IPv4 בלבד": 4, "IPv6 בלבד": 6}[version_label]
+    ips = pd.DataFrame(ip_stats(analysis.packets, direction, version))
     with right:
         if ips.empty:
-            st.info("אין תעבורת IP בהקלטה.")
+            st.info("אין תעבורת IP מהסוג שנבחר בהקלטה.")
         else:
             column = "packets" if metric == "חבילות" else "bytes"
             top = ips.sort_values(column, ascending=False).head(top_n)
@@ -203,6 +205,8 @@ def render_transactions(analysis: CaptureAnalysis) -> None:
         st.info("לא נמצאו טרנזקציות HTTP בהקלטה (ייתכן שכל התעבורה מוצפנת ב-HTTPS).")
         return
     table = transactions_table(analysis)
+    render_response_times(table)
+    st.subheader("רשימת הטרנזקציות")
     st.caption(f"{len(table)} טרנזקציות (זוגות בקשה–תגובה). לחצו על שורה לפרטים מלאים.")
     event = st.dataframe(table, hide_index=True, width="stretch", on_select="rerun",
                          selection_mode="single-row", key="transactions")
@@ -210,6 +214,32 @@ def render_transactions(analysis: CaptureAnalysis) -> None:
     if rows and rows[0] < len(table):
         st.divider()
         render_transaction(analysis, analysis.transactions[rows[0]])
+
+
+def render_response_times(table: pd.DataFrame) -> None:
+    """Response time of every transaction that got a response, plus summary numbers."""
+    st.subheader("זמני תגובה")
+    times = table.dropna(subset=["Response time (ms)"])
+    if times.empty:
+        st.info("לא נקלטו תגובות, ולכן אין זמני תגובה להציג.")
+        return
+    column = times["Response time (ms)"]
+    slowest = times.loc[column.idxmax()]
+    cols = st.columns(4)
+    cols[0].metric("ממוצע", f"{column.mean():,.1f} ms")
+    cols[1].metric("חציון", f"{column.median():,.1f} ms")
+    cols[2].metric("מינימום", f"{column.min():,.1f} ms")
+    cols[3].metric("מקסימום", f"{column.max():,.1f} ms", help=f"טרנזקציה {slowest['#']}: {slowest['Method']} {slowest['URI']}")
+
+    chart = times.assign(Host=times["Host"].fillna("(ללא Host)"), Transaction=times["#"].astype(str))
+    fig = px.bar(chart, x="Transaction", y="Response time (ms)", color="Host",
+                 hover_data=["Method", "URI", "Status", "Request frame", "Response frame"],
+                 labels={"Transaction": "טרנזקציה", "Response time (ms)": "זמן תגובה (ms)"})
+    fig.add_hline(y=column.median(), line_dash="dot", annotation_text="חציון")
+    fig.update_xaxes(type="category")
+    fig.update_layout(margin={"l": 10, "r": 10, "t": 10, "b": 10}, legend_title_text="Host")
+    st.plotly_chart(fig, width="stretch")
+    st.caption("זמן תגובה = הזמן מהחבילה שהשלימה את הבקשה ועד החבילה שהשלימה את התגובה (כמו http.time ב-Wireshark).")
 
 
 def render_transaction(analysis: CaptureAnalysis, tx) -> None:
@@ -260,18 +290,26 @@ def _message_text(message, body_limit: int = 3000) -> str:
 def render_ai(analysis: CaptureAnalysis) -> None:
     st.markdown("שאלו שאלה חופשית על ההקלטה. ל-AI נשלחים **רק הנתונים שחולצו** (סיכום, סטטיסטיקות, "
                 "שמות דומיין וטרנזקציות HTTP), ולא קובץ ה-PCAP עצמו.")
-    key_from_env = os.getenv("ANTHROPIC_API_KEY")
-    api_key = key_from_env
-    if not key_from_env:
-        st.warning("לא נמצא ANTHROPIC_API_KEY בקובץ .env. אפשר להזין מפתח כאן לסשן הנוכחי בלבד (הוא לא נשמר).")
-        api_key = st.text_input("API key", type="password", key="api_key")
+    provider = st.radio("ספק AI", list(ai_helper.PROVIDERS), horizontal=True, key="ai_provider",
+                        format_func=lambda p: ai_helper.PROVIDERS[p]["label"])
+    settings = ai_helper.PROVIDERS[provider]
+    api_key = ai_helper.api_key_from_env(provider)
+    if api_key:
+        st.success(f"נמצא מפתח {settings['env_key']} בקובץ .env.")
+    else:
+        st.info(f"לא נמצא {settings['env_key']} בקובץ .env. כדי לשמור מפתח קבוע, הוסיפו לקובץ .env את השורה "
+                f"`{settings['env_key']}=...` והפעילו מחדש את הדשבורד. אפשר גם להזין מפתח כאן לסשן הנוכחי בלבד "
+                f"(הוא לא נשמר). יצירת מפתח: {settings['key_url']}")
+        api_key = st.text_input(f"{settings['label']} API key", type="password", key=f"api_key_{provider}")
+
+    model = render_model_picker(provider, api_key)
 
     question = st.text_area("השאלה שלך", placeholder="למשל: לאילו אתרים נשלחו בקשות HTTP, ומה היה זמן התגובה הארוך ביותר?",
                             key="ai_question")
-    if st.button("שלח שאלה", type="primary", disabled=not question.strip()):
+    if st.button("שלח שאלה", type="primary", disabled=not question.strip() or not api_key):
         try:
-            with st.spinner("שולח ל-AI..."):
-                answer = ai_helper.ask(question.strip(), analysis, api_key=api_key)
+            with st.spinner(f"שולח ל-{settings['label']}..."):
+                answer = ai_helper.ask(question.strip(), analysis, provider=provider, api_key=api_key, model=model)
             st.session_state.setdefault("ai_history", []).insert(0, (analysis.file_name, question.strip(), answer))
         except Exception as error:  # network, authentication or quota errors are shown, not raised
             st.error(f"השאלה נכשלה: {error}")
@@ -280,6 +318,7 @@ def render_ai(analysis: CaptureAnalysis) -> None:
         if file_name != analysis.file_name:
             continue
         with st.container(border=True):
+            st.caption(f"{answer.provider} · {answer.model}")
             st.markdown(f"**שאלה:** {asked}")
             st.markdown(f"**תשובה:** {answer.answer}")
             if answer.evidence:
@@ -296,6 +335,25 @@ def render_ai(analysis: CaptureAnalysis) -> None:
 
     with st.expander("הנתונים שנשלחים ל-AI"):
         st.json(ai_helper.build_context(analysis), expanded=False)
+
+
+@st.cache_data(ttl=3600, show_spinner="טוען את רשימת המודלים של Gemini...")
+def cached_gemini_models(api_key: str) -> list[str]:
+    return ai_helper.list_gemini_models(api_key)
+
+
+def render_model_picker(provider: str, api_key: str | None) -> str:
+    """Gemini: choose from the models this key can really use. Claude: a model name with a sensible default."""
+    if provider == "gemini" and api_key:
+        try:
+            names = cached_gemini_models(api_key)
+        except Exception as error:
+            st.warning(f"לא הצלחתי לטעון את רשימת המודלים ({error}). אפשר להקליד שם מודל ידנית.")
+            names = []
+        if names:
+            default = ai_helper.pick_gemini_default(names)
+            return st.selectbox("מודל", names, index=names.index(default) if default in names else 0, key="gemini_model")
+    return st.text_input("מודל", value=ai_helper.default_model(provider), key=f"model_{provider}")
 
 
 # ---------------------------------------------------------------- main
