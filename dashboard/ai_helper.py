@@ -19,7 +19,7 @@ PROVIDERS = {
     "anthropic": {"label": "Claude (Anthropic)", "env_key": "ANTHROPIC_API_KEY", "env_model": "AI_MODEL",
                   "default_model": "claude-sonnet-5-5", "key_url": "https://console.anthropic.com/settings/keys"},
     "gemini": {"label": "Gemini (Google)", "env_key": "GEMINI_API_KEY", "env_model": "GEMINI_MODEL",
-               "default_model": "gemini-2.5-flash", "key_url": "https://aistudio.google.com/apikey"},
+               "default_model": "gemini-3.8-flash", "key_url": "https://aistudio.google.com/apikey"},
 }
 
 MAX_TRANSACTIONS = 150
@@ -164,8 +164,9 @@ def list_gemini_models(api_key: str) -> list[str]:
     """Gemini models this key can use for text generation, so the user picks a real name instead of a guess."""
     from google import genai
 
+    client = genai.Client(api_key=api_key)  # keep a reference: the list is fetched lazily, page by page
     names = []
-    for model in genai.Client(api_key=api_key).models.list():
+    for model in list(client.models.list()):
         actions = getattr(model, "supported_actions", None) or []
         name = (model.name or "").removeprefix("models/")
         if name.startswith("gemini") and (not actions or "generateContent" in actions):

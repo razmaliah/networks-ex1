@@ -100,7 +100,7 @@ def test_gemini_default_model(monkeypatch):
     from ai_helper import pick_gemini_default
 
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
-    names = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.0-flash-preview"]
-    assert pick_gemini_default(names) == "gemini-2.5-flash"
-    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
-    assert pick_gemini_default(names) == "gemini-2.5-pro"
+    names = ["gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-pro", "gemini-4-flash-preview"]
+    assert pick_gemini_default(names) == "gemini-3.8-flash"
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-pro")
+    assert pick_gemini_default(names) == "gemini-3.8-pro"
