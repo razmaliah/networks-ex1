@@ -108,3 +108,9 @@ def sample_frames() -> list[tuple[float, bytes]]:
     add(0.500, ethernet_ipv4(c, "151.101.1.69", 6, tcp(52000, 443, 7000, 1, PSH_ACK, client_hello("secure.example.org"))))  # 13
     add(0.600, ethernet_ipv4(c, s, 6, tcp(51000, 80, cs2 + len(req2), ss2 + len(resp2), FIN_ACK)))                      # 14
     return f
+
+
+def ethernet_ipv6_udp(src: bytes, dst: bytes, sport: int, dport: int, payload: bytes) -> bytes:
+    datagram = udp(sport, dport, payload)
+    header = struct.pack(">IHBB", 6 << 28, len(datagram), 17, 64) + src + dst
+    return CLIENT_MAC + SERVER_MAC + b"\x86\xdd" + header + datagram

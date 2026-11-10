@@ -28,11 +28,14 @@ def summarize(packets: list[Packet]) -> CaptureSummary:
     return CaptureSummary(len(packets), min(times), max(times), sum(p.length for p in packets))
 
 
-def ip_stats(packets: list[Packet], direction: str = "both") -> list[dict]:
-    """Packets and bytes per IP address. direction: 'src', 'dst' or 'both' (address on either side)."""
+def ip_stats(packets: list[Packet], direction: str = "both", version: int | None = None) -> list[dict]:
+    """Packets and bytes per IP address.
+
+    direction: 'src', 'dst' or 'both' (address on either side). version: 4 or 6 to keep only that IP version.
+    """
     count, size = Counter(), Counter()
     for packet in packets:
-        if packet.src_ip is None:
+        if packet.src_ip is None or (version is not None and packet.ip_version != version):
             continue
         addresses = {"src": [packet.src_ip], "dst": [packet.dst_ip]}.get(direction, [packet.src_ip, packet.dst_ip])
         for address in set(addresses):

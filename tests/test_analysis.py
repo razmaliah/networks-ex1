@@ -81,3 +81,26 @@ def test_ai_context_and_answer_parsing(capture):
     assert answer.answer == "GET to example.com"
     assert answer.invalid_frames == [99]
     assert parse_answer("plain text", 14).answer == "plain text"
+
+
+def test_ip_version_filter():
+    from capture_builder import ethernet_ipv4, ethernet_ipv6_udp, udp
+
+    v6_src, v6_dst = bytes.fromhex("fe80" + "00" * 12 + "0001"), bytes.fromhex("ff02" + "00" * 13 + "fb")
+    frames = [(1.0, ethernet_ipv4("10.0.0.1", "10.0.0.2", 17, udp(1000, 2000, b"hi"))),
+              (2.0, ethernet_ipv6_udp(v6_src, v6_dst, 5353, 5353, b"\x00" * 12))]
+    packets = analyze(write_pcap(frames)).packets
+    assert packets[1].src_ip == "fe80::1" and packets[1].ip_version == 6
+    assert {r["ip"] for r in ip_stats(packets, "both", 4)} == {"10.0.0.1", "10.0.0.2"}
+    assert {r["ip"] for r in ip_stats(packets, "src", 6)} == {"fe80::1"}
+    assert len(ip_stats(packets, "both")) == 4
+
+
+def test_gemini_default_model(monkeypatch):
+    from ai_helper import pick_gemini_default
+
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    names = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro", "gemini-3.0-flash-preview"]
+    assert pick_gemini_default(names) == "gemini-2.5-flash"
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-pro")
+    assert pick_gemini_default(names) == "gemini-2.5-pro"
