@@ -19,13 +19,23 @@ from pcap_reader import CaptureFormatError
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 st.set_page_config(page_title="PCAP Dashboard", page_icon="📡", layout="wide")
+# Hebrew UI: the whole page is right-to-left (so columns, buttons and labels start from the right),
+# while data views (tables, charts, code, sliders) stay left-to-right.
 st.markdown(
     """<style>
-    [data-testid="stMarkdownContainer"], h1, h2, h3, .stAlert, [data-testid="stWidgetLabel"],
-    [data-testid="stMetric"], .stRadio, .stCheckbox {direction: rtl; text-align: right;}
-    code, pre {direction: ltr; text-align: left;}
-    [data-testid="stTabs"] [role="tablist"] {direction: rtl; justify-content: flex-start;}
-    [data-testid="stSlider"] [data-baseweb="slider"], [data-testid="stSlider"] [data-baseweb="slider"] * {direction: ltr !important;}
+    [data-testid="stMain"], [data-testid="stMainBlockContainer"], section.main {direction: rtl;}
+    h1, h2, h3, h4, [data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"], [data-testid="stCaptionContainer"] {
+        text-align: right;
+    }
+    [data-testid="stDataFrame"], [data-testid="stPlotlyChart"], .stPlotlyChart, [data-testid="stJson"], code, pre,
+    [data-testid="stSlider"] [data-baseweb="slider"], [data-testid="stSlider"] [data-baseweb="slider"] * {
+        direction: ltr; text-align: left;
+    }
+    [data-testid="stTabs"] [role="tablist"] {justify-content: flex-start;}
+    /* typed text: each line gets its direction from its first letters (Hebrew right-to-left, English left-to-right) */
+    textarea, input[type="text"] {unicode-bidi: plaintext; text-align: start;}
+    input[type="password"] {direction: ltr;}
+    .st-key-new_conversation {direction: ltr;}
     </style>""",
     unsafe_allow_html=True,
 )
@@ -328,10 +338,10 @@ def render_ai(analysis: CaptureAnalysis) -> None:
     for _file, asked, answer in conversation:
         render_ai_answer(analysis, asked, answer)
 
-    left, right = st.columns([3, 1])
-    follow_up = left.toggle("שאלת המשך: ה-AI רואה את השאלות והתשובות הקודמות", value=True, key="ai_follow_up",
+    toggle_column, button_column = st.columns([3, 1])  # right-to-left page: the first column is on the right
+    follow_up = toggle_column.toggle("שאלת המשך: ה-AI רואה את השאלות והתשובות הקודמות", value=True, key="ai_follow_up",
                             disabled=not conversation)
-    if right.button("שיחה חדשה", disabled=not conversation):
+    if button_column.button("שיחה חדשה", disabled=not conversation, key="new_conversation"):
         st.session_state["ai_history"] = [e for e in st.session_state["ai_history"] if e[0] != analysis.file_name]
         st.rerun()
 
