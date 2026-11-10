@@ -289,6 +289,24 @@ def _message_text(message, body_limit: int = 3000) -> str:
 
 # ---------------------------------------------------------------- AI tab
 
+def render_ai_answer(analysis: CaptureAnalysis, asked: str, answer) -> None:
+    with st.container(border=True):
+        st.caption(f"{answer.provider} · {answer.model} · {answer.elapsed_s:.1f} s")
+        st.markdown(f"**שאלה:** {asked}")
+        st.markdown(f"**תשובה:** {answer.answer}")
+        if answer.evidence:
+            st.markdown("**ראיות:**")
+            evidence = pd.DataFrame([
+                {**item, "קיים בהקלטה": "⚠️ לא קיים" if item.get("frame") in answer.invalid_frames else "✅"}
+                for item in answer.evidence
+            ])
+            st.dataframe(evidence, hide_index=True, width="stretch")
+        if answer.invalid_frames:
+            st.warning(f"ה-AI ציטט חבילות שלא קיימות בהקלטה: {answer.invalid_frames}. יש לבדוק את התשובה ידנית.")
+        if answer.limitations:
+            st.caption(f"מגבלות: {answer.limitations}")
+
+
 def render_ai(analysis: CaptureAnalysis) -> None:
     st.markdown("שאלו שאלה חופשית על ההקלטה. ל-AI נשלחים **רק הנתונים שחולצו** (סיכום, סטטיסטיקות, "
                 "שמות דומיין וטרנזקציות HTTP), ולא קובץ ה-PCAP עצמו.")
@@ -306,6 +324,17 @@ def render_ai(analysis: CaptureAnalysis) -> None:
 
     model = render_model_picker(provider, api_key)
 
+    conversation = [entry for entry in st.session_state.setdefault("ai_history", []) if entry[0] == analysis.file_name]
+    for _file, asked, answer in conversation:
+        render_ai_answer(analysis, asked, answer)
+
+    left, right = st.columns([3, 1])
+    follow_up = left.toggle("שאלת המשך: ה-AI רואה את השאלות והתשובות הקודמות", value=True, key="ai_follow_up",
+                            disabled=not conversation)
+    if right.button("שיחה חדשה", disabled=not conversation):
+        st.session_state["ai_history"] = [e for e in st.session_state["ai_history"] if e[0] != analysis.file_name]
+        st.rerun()
+
     question = st.text_area("השאלה שלך", placeholder="למשל: לאילו אתרים נשלחו בקשות HTTP, ומה היה זמן התגובה הארוך ביותר?",
                             key="ai_question")
     if st.button("שלח שאלה", type="primary", disabled=not question.strip() or not api_key):
@@ -315,33 +344,16 @@ def render_ai(analysis: CaptureAnalysis) -> None:
         def show_progress(text: str) -> None:
             status.write(f"`{time.monotonic() - started:5.1f}s`  {text}")
 
+        history = [(asked, answer.raw_text) for _f, asked, answer in conversation] if follow_up else []
         try:
             answer = ai_helper.ask(question.strip(), analysis, provider=provider, api_key=api_key, model=model,
-                                   on_progress=show_progress)
+                                   on_progress=show_progress, history=history)
             status.update(label=f"התקבלה תשובה אחרי {answer.elapsed_s:.1f} שניות", state="complete", expanded=False)
-            st.session_state.setdefault("ai_history", []).insert(0, (analysis.file_name, question.strip(), answer))
+            st.session_state["ai_history"].append((analysis.file_name, question.strip(), answer))
+            st.rerun()  # show the new answer at the end of the conversation, above the question box
         except Exception as error:  # network, authentication or quota errors are shown, not raised
             status.update(label=f"נכשל אחרי {time.monotonic() - started:.1f} שניות", state="error", expanded=True)
             st.error(f"השאלה נכשלה: {error}")
-
-    for file_name, asked, answer in st.session_state.get("ai_history", []):
-        if file_name != analysis.file_name:
-            continue
-        with st.container(border=True):
-            st.caption(f"{answer.provider} · {answer.model} · {answer.elapsed_s:.1f} s")
-            st.markdown(f"**שאלה:** {asked}")
-            st.markdown(f"**תשובה:** {answer.answer}")
-            if answer.evidence:
-                st.markdown("**ראיות:**")
-                evidence = pd.DataFrame([
-                    {**item, "קיים בהקלטה": "⚠️ לא קיים" if item.get("frame") in answer.invalid_frames else "✅"}
-                    for item in answer.evidence
-                ])
-                st.dataframe(evidence, hide_index=True, width="stretch")
-            if answer.invalid_frames:
-                st.warning(f"ה-AI ציטט חבילות שלא קיימות בהקלטה: {answer.invalid_frames}. יש לבדוק את התשובה ידנית.")
-            if answer.limitations:
-                st.caption(f"מגבלות: {answer.limitations}")
 
     with st.expander("הנתונים שנשלחים ל-AI"):
         st.json(ai_helper.build_context(analysis), expanded=False)

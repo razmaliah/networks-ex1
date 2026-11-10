@@ -104,3 +104,13 @@ def test_gemini_default_model(monkeypatch):
     assert pick_gemini_default(names) == "gemini-3.8-flash"
     monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-pro")
     assert pick_gemini_default(names) == "gemini-3.8-pro"
+
+
+def test_follow_up_turns(capture):
+    from ai_helper import build_turns
+
+    assert [role for role, _ in build_turns("q1", capture, [])] == ["user"]
+    turns = build_turns("q3", capture, [("q1", "a1"), ("q2", "a2")])
+    assert [role for role, _ in turns] == ["user", "assistant", "user", "assistant", "user"]
+    assert "<capture_data>" in turns[0][1] and turns[0][1].endswith("Question: q1")
+    assert turns[1:] == [("assistant", "a1"), ("user", "Question: q2"), ("assistant", "a2"), ("user", "Question: q3")]

@@ -117,9 +117,13 @@ def default_model(provider: str) -> str:
     return os.getenv(settings["env_model"]) or settings["default_model"]
 
 
-def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic",
-        api_key: str | None = None, model: str | None = None, on_progress=None) -> AiAnswer:
-    """Sends the question with the extracted data. on_progress(text) is called with status updates for the UI."""
+def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic", api_key: str | None = None,
+        model: str | None = None, on_progress=None, history: list[tuple[str, str]] | None = None) -> AiAnswer:
+    """Sends the question with the extracted data.
+
+    history: earlier (question, raw answer) pairs about the same capture, oldest first, so the model can answer
+    follow-up questions ("you were wrong, check again"). on_progress(text) receives status updates for the UI.
+    """
     settings = PROVIDERS[provider]
     api_key = api_key or api_key_from_env(provider)
     if not api_key:
@@ -127,14 +131,15 @@ def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic",
     model = model or default_model(provider)
     progress = on_progress or (lambda _text: None)
 
-    context = json.dumps(build_context(analysis), ensure_ascii=False)
-    prompt = f"<capture_data>\n{context}\n</capture_data>\n\nQuestion: {question}"
-    progress(f"Sending {len(prompt) / 1024:,.0f} KB of extracted data to {model}...")
+    turns = build_turns(question, analysis, history or [])
+    size_kb = sum(len(text) for _role, text in turns) / 1024
+    follow_up = f" (with {len(history)} earlier questions)" if history else ""
+    progress(f"Sending {size_kb:,.0f} KB of extracted data to {model}{follow_up}...")
     started = time.monotonic()
     if provider == "gemini":
-        text = _ask_gemini(prompt, api_key, model, progress)
+        text = _ask_gemini(turns, api_key, model, progress)
     else:
-        text = _ask_claude(prompt, api_key, model)
+        text = _ask_claude(turns, api_key, model)
 
     answer = parse_answer(text, analysis.summary.packet_count)
     answer.provider, answer.model = settings["label"], model
@@ -142,14 +147,26 @@ def ask(question: str, analysis: CaptureAnalysis, provider: str = "anthropic",
     return answer
 
 
-def _ask_claude(prompt: str, api_key: str, model: str) -> str:
+def build_turns(question: str, analysis: CaptureAnalysis, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """The conversation as (role, text) turns. The capture data is sent once, in the first user turn."""
+    context = json.dumps(build_context(analysis), ensure_ascii=False)
+    questions = [q for q, _a in history] + [question]
+    answers = [a for _q, a in history]
+    turns = [("user", f"<capture_data>\n{context}\n</capture_data>\n\nQuestion: {questions[0]}")]
+    for answer, next_question in zip(answers, questions[1:]):
+        turns.append(("assistant", answer))
+        turns.append(("user", f"Question: {next_question}"))
+    return turns
+
+
+def _ask_claude(turns: list[tuple[str, str]], api_key: str, model: str) -> str:
     try:
         import anthropic
     except ImportError as error:
         raise RuntimeError("The 'anthropic' package is not installed: pip install -r requirements.txt") from error
     client = anthropic.Anthropic(api_key=api_key, timeout=GEMINI_TIMEOUT_S)
     response = client.messages.create(model=model, max_tokens=2000, system=SYSTEM_PROMPT,
-                                      messages=[{"role": "user", "content": prompt}])
+                                      messages=[{"role": role, "content": text} for role, text in turns])
     return "".join(block.text for block in response.content if block.type == "text")
 
 
@@ -166,7 +183,7 @@ def _gemini_thinking(types, model: str):
     return None
 
 
-def _ask_gemini(prompt: str, api_key: str, model: str, progress) -> str:
+def _ask_gemini(turns: list[tuple[str, str]], api_key: str, model: str, progress) -> str:
     try:
         from google import genai
         from google.genai import types
@@ -179,6 +196,7 @@ def _ask_gemini(prompt: str, api_key: str, model: str, progress) -> str:
                                            max_output_tokens=8192, thinking_config=thinking)
 
     config = make_config(_gemini_thinking(types, model))
+    contents = [{"role": "model" if role == "assistant" else "user", "parts": [{"text": text}]} for role, text in turns]
     deadline = time.monotonic() + GEMINI_TOTAL_BUDGET_S
     attempt = 0
     while True:
@@ -186,7 +204,7 @@ def _ask_gemini(prompt: str, api_key: str, model: str, progress) -> str:
         if attempt > 1:
             progress(f"Attempt {attempt} of {GEMINI_ATTEMPTS}...")
         try:
-            response = client.models.generate_content(model=model, contents=prompt, config=config)
+            response = client.models.generate_content(model=model, contents=contents, config=config)
             break
         except Exception as error:
             code = getattr(error, "code", None)
