@@ -27,11 +27,14 @@ st.markdown(
     h1, h2, h3, h4, [data-testid="stMarkdownContainer"], [data-testid="stWidgetLabel"], [data-testid="stCaptionContainer"] {
         text-align: right;
     }
-    [data-testid="stDataFrame"], [data-testid="stPlotlyChart"], .stPlotlyChart, [data-testid="stJson"], code, pre,
-    [data-testid="stSlider"] [data-baseweb="slider"], [data-testid="stSlider"] [data-baseweb="slider"] * {
+    [data-testid="stDataFrame"], [data-testid="stPlotlyChart"], .stPlotlyChart, [data-testid="stJson"], code, pre {
         direction: ltr; text-align: left;
     }
+    [data-testid="stMetricValue"] {direction: ltr; text-align: right;}  /* "3.9 KB", not "KB 3.9" */
+    [data-testid="stCheckbox"] label > div:not([data-testid]) {direction: ltr;}  /* keeps the toggle knob in its track */
     [data-testid="stTabs"] [role="tablist"] {justify-content: flex-start;}
+    [data-testid="stTab"] {padding: 0.4rem 0.9rem;}
+    [data-testid="stTab"] p {font-size: 1.2rem !important; font-weight: 600;}
     /* typed text: each line gets its direction from its first letters (Hebrew right-to-left, English left-to-right) */
     textarea, input[type="text"] {unicode-bidi: plaintext; text-align: start;}
     input[type="password"] {direction: ltr;}
@@ -63,7 +66,7 @@ def render_summary(analysis: CaptureAnalysis) -> None:
     s = analysis.summary
     cols = st.columns(5)
     cols[0].metric("מספר חבילות", f"{s.packet_count:,}")
-    cols[1].metric("משך ההקלטה", f"{s.duration:,.3f} שניות")
+    cols[1].metric("משך ההקלטה (שניות)", f"{s.duration:,.3f}")
     cols[2].metric("נפח כולל", fmt_bytes(s.total_bytes))
     cols[3].metric("טרנזקציות HTTP", len(analysis.transactions))
     cols[4].metric("כתובות IP שונות", len(ip_stats(analysis.packets, "both")))
@@ -74,7 +77,8 @@ def render_summary(analysis: CaptureAnalysis) -> None:
     with left:
         mode = st.radio("פילוח לפי", ["הכל", "מקור (Source)", "יעד (Destination)"], key="ip_mode")
         version_label = st.radio("גרסת IP", ["IPv4 + IPv6", "IPv4 בלבד", "IPv6 בלבד"], key="ip_version")
-        top_n = st.slider("כמה כתובות להציג", 5, 30, 10, key="ip_top")
+        # a number field rather than st.slider: the slider handle is drawn mirrored in browsers set to Hebrew
+        top_n = st.number_input("כמה כתובות להציג", min_value=1, max_value=50, value=10, step=1, key="ip_top")
         metric = st.radio("מדד", ["חבילות", "בתים"], horizontal=True, key="ip_metric")
     direction = {"הכל": "both", "מקור (Source)": "src", "יעד (Destination)": "dst"}[mode]
     version = {"IPv4 + IPv6": None, "IPv4 בלבד": 4, "IPv6 בלבד": 6}[version_label]
