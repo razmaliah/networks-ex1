@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 import ai_helper
@@ -44,6 +45,21 @@ st.markdown(
     </style>""",
     unsafe_allow_html=True,
 )
+
+
+def force_left_to_right_widgets() -> None:
+    """Streamlit's slider (built on react-aria) takes its direction from the browser language: in a browser set to
+    Hebrew it places the handle from the right while the filled bar is drawn from the left, so they disagree.
+    react-aria reads a documented global override (Symbol.for('react-aria.i18n.locale')) and re-reads it on a
+    'languagechange' event, so we set it to English on the page. Only widget layout is affected, not the text."""
+    components.html(
+        """<script>
+        const page = window.parent;
+        page[page.Symbol.for('react-aria.i18n.locale')] = 'en-US';
+        page.dispatchEvent(new page.Event('languagechange'));
+        </script>""",
+        height=0,
+    )
 
 
 @st.cache_resource(show_spinner="מנתח את ההקלטה...", max_entries=3)
@@ -419,6 +435,7 @@ def main() -> None:
         render_transactions(analysis)
     with ai_tab:
         render_ai(analysis)
+    force_left_to_right_widgets()
 
 
 main()
