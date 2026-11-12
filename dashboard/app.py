@@ -32,6 +32,8 @@ st.markdown(
     }
     [data-testid="stMetricValue"] {direction: ltr; text-align: right;}  /* "3.9 KB", not "KB 3.9" */
     [data-testid="stCheckbox"] label > div:not([data-testid]) {direction: ltr;}  /* keeps the toggle knob in its track */
+    /* sliders run left-to-right (min on the left), so the scale labels match the filled bar */
+    [data-testid="stSlider"] [role="group"], [data-testid="stSlider"] [role="group"] * {direction: ltr;}
     [data-testid="stTabs"] [role="tablist"] {justify-content: flex-start;}
     [data-testid="stTab"] {padding: 0.4rem 0.9rem;}
     [data-testid="stTab"] p {font-size: 1.2rem !important; font-weight: 600;}
@@ -77,8 +79,7 @@ def render_summary(analysis: CaptureAnalysis) -> None:
     with left:
         mode = st.radio("פילוח לפי", ["הכל", "מקור (Source)", "יעד (Destination)"], key="ip_mode")
         version_label = st.radio("גרסת IP", ["IPv4 + IPv6", "IPv4 בלבד", "IPv6 בלבד"], key="ip_version")
-        # a number field rather than st.slider: the slider handle is drawn mirrored in browsers set to Hebrew
-        top_n = st.number_input("כמה כתובות להציג", min_value=1, max_value=50, value=10, step=1, key="ip_top")
+        top_n = st.slider("כמה כתובות להציג", 5, 30, 10, key="ip_top")
         metric = st.radio("מדד", ["חבילות", "בתים"], horizontal=True, key="ip_metric")
     direction = {"הכל": "both", "מקור (Source)": "src", "יעד (Destination)": "dst"}[mode]
     version = {"IPv4 + IPv6": None, "IPv4 בלבד": 4, "IPv6 בלבד": 6}[version_label]
