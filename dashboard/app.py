@@ -13,7 +13,8 @@ import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 import ai_helper
-from analysis import analyze, ip_stats, packets_per_second, protocol_stats, relative_time, resolved_names
+from analysis import (analyze, http_statistics, ip_stats, packets_per_second, protocol_stats, relative_time,
+                      resolved_names)
 from models import CaptureAnalysis, Packet
 from pcap_reader import CaptureFormatError
 
@@ -238,6 +239,7 @@ def render_transactions(analysis: CaptureAnalysis) -> None:
         st.info("לא נמצאו טרנזקציות HTTP בהקלטה (ייתכן שכל התעבורה מוצפנת ב-HTTPS).")
         return
     table = transactions_table(analysis)
+    render_http_statistics(http_statistics(analysis))
     render_response_times(table)
     st.subheader("רשימת הטרנזקציות")
     st.caption(f"{len(table)} טרנזקציות (זוגות בקשה–תגובה). לחצו על שורה לפרטים מלאים.")
@@ -249,20 +251,44 @@ def render_transactions(analysis: CaptureAnalysis) -> None:
         render_transaction(analysis, analysis.transactions[rows[0]])
 
 
+def render_http_statistics(stats: dict) -> None:
+    """Totals per Host and Status Code and response-time numbers, computed in analysis.http_statistics
+    (the same numbers the AI receives)."""
+    st.subheader("סטטיסטיקת HTTP")
+    cols = st.columns(5)
+    cols[0].metric("בקשות", stats["requests"])
+    cols[1].metric("קיבלו תגובה", f"{stats['requests_with_response']} / {stats['requests']}")
+    times = stats["response_time"]
+    if times:
+        slowest = stats["slowest"][0]
+        cols[2].metric("זמן תגובה ממוצע", f"{times['average_s'] * 1000:,.1f} ms")
+        cols[3].metric("חציון", f"{times['median_s'] * 1000:,.1f} ms")
+        cols[4].metric("האיטית ביותר", f"{times['max_s'] * 1000:,.1f} ms",
+                       help=f"טרנזקציה {slowest['transaction']}: {slowest['method']} {slowest['uri']} "
+                            f"(frames {slowest['request_frame']} → {slowest['response_frame']})")
+
+    left, right = st.columns(2)  # right-to-left page: the first column is on the right
+    with left:
+        st.markdown("**בקשות לפי Host**")
+        st.dataframe(pd.DataFrame([{"Host": row["host"], "בקשות": row["requests"]} for row in stats["requests_per_host"]]),
+                     hide_index=True, width="stretch")
+    with right:
+        st.markdown("**Status Codes**")
+        st.dataframe(pd.DataFrame([{"Status": row["status"], "כמות": row["count"]} for row in stats["status_codes"]]),
+                     hide_index=True, width="stretch")
+    if stats["requests_without_response"]:
+        frames = ", ".join(str(row["request_frame"]) for row in stats["requests_without_response"])
+        st.warning(f"{len(stats['requests_without_response'])} בקשות לא קיבלו תגובה בהקלטה (frames {frames}).")
+
+
 def render_response_times(table: pd.DataFrame) -> None:
-    """Response time of every transaction that got a response, plus summary numbers."""
+    """Bar chart of the response time of every transaction that got a response."""
     st.subheader("זמני תגובה")
     times = table.dropna(subset=["Response time (ms)"])
     if times.empty:
         st.info("לא נקלטו תגובות, ולכן אין זמני תגובה להציג.")
         return
     column = times["Response time (ms)"]
-    slowest = times.loc[column.idxmax()]
-    cols = st.columns(4)
-    cols[0].metric("ממוצע", f"{column.mean():,.1f} ms")
-    cols[1].metric("חציון", f"{column.median():,.1f} ms")
-    cols[2].metric("מינימום", f"{column.min():,.1f} ms")
-    cols[3].metric("מקסימום", f"{column.max():,.1f} ms", help=f"טרנזקציה {slowest['#']}: {slowest['Method']} {slowest['URI']}")
 
     chart = times.assign(Host=times["Host"].fillna("(ללא Host)"), Transaction=times["#"].astype(str))
     fig = px.bar(chart, x="Transaction", y="Response time (ms)", color="Host",
@@ -322,7 +348,8 @@ def _message_text(message, body_limit: int = 3000) -> str:
 
 def render_ai_answer(analysis: CaptureAnalysis, asked: str, answer) -> None:
     with st.container(border=True):
-        st.caption(f"{answer.provider} · {answer.model} · {answer.elapsed_s:.1f} s")
+        selected_note = f" · טרנזקציה נבחרת #{answer.selected_transaction}" if answer.selected_transaction else ""
+        st.caption(f"{answer.provider} · {answer.model} · {answer.elapsed_s:.1f} s{selected_note}")
         st.markdown(f"**שאלה:** {asked}")
         st.markdown(f"**תשובה:** {answer.answer}")
         if answer.evidence:
@@ -366,6 +393,7 @@ def render_ai(analysis: CaptureAnalysis) -> None:
         st.session_state["ai_history"] = [e for e in st.session_state["ai_history"] if e[0] != analysis.file_name]
         st.rerun()
 
+    selected = render_transaction_picker(analysis)
     question = st.text_area("השאלה שלך", placeholder="למשל: לאילו אתרים נשלחו בקשות HTTP, ומה היה זמן התגובה הארוך ביותר?",
                             key="ai_question")
     if st.button("שלח שאלה", type="primary", disabled=not question.strip() or not api_key):
@@ -378,7 +406,7 @@ def render_ai(analysis: CaptureAnalysis) -> None:
         history = [(asked, answer.raw_text) for _f, asked, answer in conversation] if follow_up else []
         try:
             answer = ai_helper.ask(question.strip(), analysis, provider=provider, api_key=api_key, model=model,
-                                   on_progress=show_progress, history=history)
+                                   on_progress=show_progress, history=history, selected=selected)
             status.update(label=f"התקבלה תשובה אחרי {answer.elapsed_s:.1f} שניות", state="complete", expanded=False)
             st.session_state["ai_history"].append((analysis.file_name, question.strip(), answer))
             st.rerun()  # show the new answer at the end of the conversation, above the question box
@@ -388,6 +416,30 @@ def render_ai(analysis: CaptureAnalysis) -> None:
 
     with st.expander("הנתונים שנשלחים ל-AI"):
         st.json(ai_helper.build_context(analysis), expanded=False)
+        if selected is not None:
+            st.markdown(f"**ועם השאלה, הטרנזקציה הנבחרת ({selected.index}) והחיבור שלה:**")
+            st.json(ai_helper.selected_transaction_context(analysis, selected), expanded=False)
+
+
+def render_transaction_picker(analysis: CaptureAnalysis):
+    """Lets the user pick one HTTP transaction for questions like "what happened in the selected stream"."""
+    if not analysis.transactions:
+        return None
+
+    by_index = {tx.index: tx for tx in analysis.transactions}
+
+    def label(index) -> str:
+        if index is None:
+            return "ללא (שאלה על כל ההקלטה)"
+        tx = by_index[index]
+        status = tx.response.status_code if tx.response else "אין תגובה"
+        response_frame = tx.response.last_frame if tx.response else "-"
+        return (f"#{tx.index} · {tx.request.method} {tx.host or ''}{tx.request.uri} → {status} "
+                f"(frames {tx.request.last_frame} → {response_frame})")
+
+    index = st.selectbox("טרנזקציה נבחרת (לשאלות כמו \"מה קרה ב-Stream שנבחר\")", [None] + list(by_index),
+                         format_func=label, key=f"ai_selected_{analysis.file_name}")
+    return by_index.get(index)
 
 
 @st.cache_data(ttl=3600, show_spinner="טוען את רשימת המודלים של Gemini...")
