@@ -114,3 +114,40 @@ def test_follow_up_turns(capture):
     assert [role for role, _ in turns] == ["user", "assistant", "user", "assistant", "user"]
     assert "<capture_data>" in turns[0][1] and turns[0][1].endswith("Question: q1")
     assert turns[1:] == [("assistant", "a1"), ("user", "Question: q2"), ("assistant", "a2"), ("user", "Question: q3")]
+
+
+def test_http_statistics(capture):
+    from analysis import http_statistics
+
+    stats = http_statistics(capture)
+    assert stats["requests"] == 2 and stats["requests_with_response"] == 2
+    assert stats["requests_without_response"] == []
+    times = [tx.response_time for tx in capture.transactions]
+    assert stats["response_time"]["average_s"] == pytest.approx(sum(times) / 2, abs=1e-6)
+    assert stats["response_time"]["max_s"] == pytest.approx(max(times), abs=1e-6)
+    assert [row["transaction"] for row in stats["slowest"]] == [1, 2]  # 109 ms, then 80 ms
+    assert stats["requests_per_host"] == [{"host": "example.com", "requests": 2, "request_frames": [7, 11]}]
+    assert {row["status"]: row["count"] for row in stats["status_codes"]} == {"200": 1, "201": 1}
+
+
+def test_selected_transaction_and_stream(capture):
+    from ai_helper import build_turns, selected_transaction_context
+    from analysis import connection_packets
+
+    first = capture.transactions[0]
+    # frames 3-12 and 14 belong to the client:51000 <-> server:80 connection (SYN ... FIN)
+    assert [p.number for p in connection_packets(capture, first)] == [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14]
+
+    selected = selected_transaction_context(capture, first)
+    assert selected["transaction"]["id"] == 1
+    assert selected["same_connection_transactions"] == [1, 2]
+    assert selected["connection_packets"][0] == {"frame": 3, "t": 0.03, "direction": "client->server",
+                                                 "tcp_flags": ["SYN"], "payload_bytes": 0,
+                                                 "info": "51000 → 80 [SYN] Len=0"}
+    assert selected["transaction"]["response_body_preview"].startswith("<html>")
+
+    # the selection is sent with the newest question only
+    turns = build_turns("q2", capture, [("q1", "a1")], selected=first)
+    assert "<selected_transaction>" not in turns[0][1]
+    assert turns[-1][1].startswith("<selected_transaction>") and turns[-1][1].endswith("Question: q2")
+    assert '"http_statistics"' in turns[0][1]

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 
 from http_parser import extract_http
-from models import CaptureAnalysis, CaptureSummary, Packet
+from models import CaptureAnalysis, CaptureSummary, HttpTransaction, Packet
 from packet_parser import decode_frames
 from pcap_reader import read_capture
 
@@ -114,3 +114,56 @@ def relative_time(analysis: CaptureAnalysis, packet_or_ts) -> float:
     """Seconds since the first packet, like Wireshark's default Time column."""
     ts = packet_or_ts.timestamp if isinstance(packet_or_ts, Packet) else packet_or_ts
     return ts - (analysis.summary.start_time or 0.0)
+
+
+def http_statistics(analysis: CaptureAnalysis, top: int = 5) -> dict:
+    """Summary numbers about the HTTP transactions, computed in code.
+
+    The AI receives these ready-made: comparing or averaging many decimal numbers is where language models
+    make mistakes (it once picked a transaction 0.2 ms faster than the real slowest one, and got the average wrong).
+    """
+    transactions = analysis.transactions
+    answered = [tx for tx in transactions if tx.response is not None]
+    times = sorted(tx.response_time for tx in answered)
+
+    def row(tx) -> dict:
+        return {
+            "transaction": tx.index,
+            "request_frame": tx.request.last_frame,
+            "response_frame": tx.response.last_frame if tx.response else None,
+            "method": tx.request.method,
+            "host": tx.host,
+            "uri": tx.request.uri,
+            "status": tx.response.status_code if tx.response else None,
+            "response_time_s": round(tx.response_time, 6) if tx.response else None,
+        }
+
+    per_host: dict[str, list[int]] = {}
+    for tx in transactions:
+        per_host.setdefault(tx.host or "(no Host header)", []).append(tx.request.last_frame)
+    status_counts = Counter(tx.response.status_code if tx.response else "no response" for tx in transactions)
+
+    response_time = None
+    if times:
+        middle = len(times) // 2
+        median = times[middle] if len(times) % 2 else (times[middle - 1] + times[middle]) / 2
+        response_time = {"average_s": round(sum(times) / len(times), 6), "median_s": round(median, 6),
+                         "min_s": round(times[0], 6), "max_s": round(times[-1], 6)}
+
+    return {
+        "requests": len(transactions),
+        "requests_with_response": len(answered),
+        "requests_without_response": [row(tx) for tx in transactions if tx.response is None],
+        "response_time": response_time,
+        "slowest": [row(tx) for tx in sorted(answered, key=lambda tx: tx.response_time, reverse=True)[:top]],
+        "requests_per_host": [{"host": host, "requests": len(frames), "request_frames": frames}
+                              for host, frames in sorted(per_host.items(), key=lambda item: -len(item[1]))],
+        "status_codes": [{"status": str(status), "count": count} for status, count in status_counts.most_common()],
+    }
+
+
+def connection_packets(analysis: CaptureAnalysis, transaction: HttpTransaction) -> list[Packet]:
+    """All packets of the TCP connection (the 'stream') that carried a transaction, in capture order."""
+    ends = {(transaction.client_ip, transaction.client_port), (transaction.server_ip, transaction.server_port)}
+    return [p for p in analysis.packets
+            if p.transport == "TCP" and {(p.src_ip, p.src_port), (p.dst_ip, p.dst_port)} == ends]

@@ -12,8 +12,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from analysis import conversations, ip_stats, protocol_stats, relative_time, resolved_names
-from models import CaptureAnalysis
+from analysis import (connection_packets, conversations, http_statistics, ip_stats, protocol_stats, relative_time,
+                      resolved_names)
+from models import CaptureAnalysis, HttpTransaction
 
 # provider id -> settings (the first one is the default in the UI)
 PROVIDERS = {
@@ -30,6 +31,8 @@ GEMINI_ATTEMPTS = 3
 RETRY_CODES = (429, 500, 503, 504)  # rate limit / temporary server errors
 MAX_ROWS = 40
 MAX_HEADER_VALUE = 150
+MAX_STREAM_PACKETS = 200
+MAX_BODY_PREVIEW = 300
 
 SYSTEM_PROMPT = """You are a network traffic analyst. You receive data that was already extracted from a packet capture \
 (not the capture itself) and a question about it.
@@ -39,6 +42,10 @@ Rules:
 - Every claim must be backed by evidence: frame numbers ("frame") and times (the "t" values, seconds since the first packet).
 - Only cite frame numbers that appear in the data.
 - Answer in the language of the question.
+- For "slowest / fastest / average / how many / which status codes" questions, use the values in "http_statistics": \
+they were computed exactly by code. Do not compare or average the numbers yourself.
+- "The selected transaction / stream / connection" means the data in <selected_transaction>. If no transaction was \
+selected and the question asks about one, say that none is selected.
 
 Reply with ONLY a JSON object, no other text:
 {"answer": "<the answer>", "evidence": [{"frame": <int>, "t": <float or null>, "detail": "<what this frame shows>"}], \
@@ -55,6 +62,7 @@ class AiAnswer:
     provider: str = ""
     model: str = ""
     elapsed_s: float = 0.0
+    selected_transaction: int | None = None  # the transaction picked when the question was asked
 
 
 def build_context(analysis: CaptureAnalysis) -> dict:
@@ -64,28 +72,7 @@ def build_context(analysis: CaptureAnalysis) -> dict:
     def t(ts: float) -> float:
         return round(relative_time(analysis, ts), 6)
 
-    transactions = []
-    for tx in analysis.transactions[:MAX_TRANSACTIONS]:
-        response = tx.response
-        transactions.append({
-            "id": tx.index,
-            "request_frame": tx.request.last_frame,
-            "request_segments": tx.request.frames,
-            "t_request": t(tx.request.timestamp),
-            "client": f"{tx.client_ip}:{tx.client_port}",
-            "server": f"{tx.server_ip}:{tx.server_port}",
-            "request_line": tx.request.start_line,
-            "request_headers": _short_headers(tx.request.headers),
-            "request_body_bytes": tx.request.body_wire_size,
-            "response_frame": response.last_frame if response else None,
-            "response_segments": response.frames if response else None,
-            "t_response": t(response.timestamp) if response else None,
-            "status": response.status_code if response else None,
-            "status_line": response.start_line if response else None,
-            "response_headers": _short_headers(response.headers) if response else None,
-            "response_body_bytes": response.body_wire_size if response else None,
-            "response_time_s": round(tx.response_time, 6) if response else None,
-        })
+    transactions = [_transaction_dict(analysis, tx) for tx in analysis.transactions[:MAX_TRANSACTIONS]]
 
     return {
         "file": analysis.file_name,
@@ -103,9 +90,71 @@ def build_context(analysis: CaptureAnalysis) -> dict:
         "domain_names": resolved_names(analysis.packets)[:MAX_ROWS * 3],
         "http_transactions": transactions,
         "http_transactions_total": len(analysis.transactions),
+        "http_statistics": http_statistics(analysis),
         "notes": "t values are seconds since the first packet. Frame numbers match Wireshark's No. column. "
                  "An HTTP message's frame is the last TCP segment that completed it.",
     }
+
+
+def _transaction_dict(analysis: CaptureAnalysis, tx: HttpTransaction) -> dict:
+    response = tx.response
+    return {
+        "id": tx.index,
+        "request_frame": tx.request.last_frame,
+        "request_segments": tx.request.frames,
+        "t_request": round(relative_time(analysis, tx.request.timestamp), 6),
+        "client": f"{tx.client_ip}:{tx.client_port}",
+        "server": f"{tx.server_ip}:{tx.server_port}",
+        "request_line": tx.request.start_line,
+        "request_headers": _short_headers(tx.request.headers),
+        "request_body_bytes": tx.request.body_wire_size,
+        "response_frame": response.last_frame if response else None,
+        "response_segments": response.frames if response else None,
+        "t_response": round(relative_time(analysis, response.timestamp), 6) if response else None,
+        "status": response.status_code if response else None,
+        "status_line": response.start_line if response else None,
+        "response_headers": _short_headers(response.headers) if response else None,
+        "response_body_bytes": response.body_wire_size if response else None,
+        "response_time_s": round(tx.response_time, 6) if response else None,
+    }
+
+
+def selected_transaction_context(analysis: CaptureAnalysis, tx: HttpTransaction) -> dict:
+    """Everything about the transaction the user picked and its TCP connection ("stream"), for "what happened in
+    the selected stream" questions: the transaction, the other transactions on the same connection, and every packet
+    of the connection with its direction, TCP flags and payload size (e.g. a SYN, FIN or RST that ended it)."""
+    packets = connection_packets(analysis, tx)
+    client = (tx.client_ip, tx.client_port)
+    stream = [{
+        "frame": p.number,
+        "t": round(relative_time(analysis, p), 6),
+        "direction": "client->server" if (p.src_ip, p.src_port) == client else "server->client",
+        "tcp_flags": p.tcp_flags,
+        "payload_bytes": len(p.payload),
+        "info": p.info,
+    } for p in packets[:MAX_STREAM_PACKETS]]
+    details = _transaction_dict(analysis, tx)
+    if tx.request.body:
+        details["request_body_preview"] = _preview(tx.request)
+    if tx.response is not None and tx.response.body:
+        details["response_body_preview"] = _preview(tx.response)
+    return {
+        "transaction": details,
+        "same_connection_transactions": [t.index for t in analysis.transactions
+                                         if (t.client_ip, t.client_port, t.server_ip, t.server_port)
+                                         == (tx.client_ip, tx.client_port, tx.server_ip, tx.server_port)],
+        "connection_packet_count": len(packets),
+        "connection_packets": stream,
+        "connection_packets_truncated": len(packets) > MAX_STREAM_PACKETS,
+    }
+
+
+def _preview(message) -> str:
+    """The start of a text body; binary bodies (images etc.) are described, not sent."""
+    content_type = (message.header("Content-Type") or "").lower()
+    if any(kind in content_type for kind in ("text", "json", "xml", "javascript", "x-www-form-urlencoded")):
+        return message.body[:MAX_BODY_PREVIEW].decode("utf-8", "replace")
+    return f"<{len(message.body)} bytes of {content_type or 'binary data'}>"
 
 
 def api_key_from_env(provider: str) -> str | None:
@@ -118,11 +167,13 @@ def default_model(provider: str) -> str:
 
 
 def ask(question: str, analysis: CaptureAnalysis, provider: str = "gemini", api_key: str | None = None,
-        model: str | None = None, on_progress=None, history: list[tuple[str, str]] | None = None) -> AiAnswer:
+        model: str | None = None, on_progress=None, history: list[tuple[str, str]] | None = None,
+        selected: HttpTransaction | None = None) -> AiAnswer:
     """Sends the question with the extracted data.
 
     history: earlier (question, raw answer) pairs about the same capture, oldest first, so the model can answer
-    follow-up questions ("you were wrong, check again"). on_progress(text) receives status updates for the UI.
+    follow-up questions ("you were wrong, check again"). selected: the transaction picked in the AI tab, if any.
+    on_progress(text) receives status updates for the UI.
     """
     settings = PROVIDERS[provider]
     api_key = api_key or api_key_from_env(provider)
@@ -131,7 +182,7 @@ def ask(question: str, analysis: CaptureAnalysis, provider: str = "gemini", api_
     model = model or default_model(provider)
     progress = on_progress or (lambda _text: None)
 
-    turns = build_turns(question, analysis, history or [])
+    turns = build_turns(question, analysis, history or [], selected)
     size_kb = sum(len(text) for _role, text in turns) / 1024
     follow_up = f" (with {len(history)} earlier questions)" if history else ""
     progress(f"Sending {size_kb:,.0f} KB of extracted data to {model}{follow_up}...")
@@ -144,18 +195,29 @@ def ask(question: str, analysis: CaptureAnalysis, provider: str = "gemini", api_
     answer = parse_answer(text, analysis.summary.packet_count)
     answer.provider, answer.model = settings["label"], model
     answer.elapsed_s = time.monotonic() - started
+    answer.selected_transaction = selected.index if selected is not None else None
     return answer
 
 
-def build_turns(question: str, analysis: CaptureAnalysis, history: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    """The conversation as (role, text) turns. The capture data is sent once, in the first user turn."""
+def build_turns(question: str, analysis: CaptureAnalysis, history: list[tuple[str, str]],
+                selected: HttpTransaction | None = None) -> list[tuple[str, str]]:
+    """The conversation as (role, text) turns. The capture data is sent once, in the first user turn; the selected
+    transaction goes with the newest question, because the user may pick a different one between questions."""
     context = json.dumps(build_context(analysis), ensure_ascii=False)
+    selected_block = ""
+    if selected is not None:
+        details = json.dumps(selected_transaction_context(analysis, selected), ensure_ascii=False)
+        selected_block = f"<selected_transaction>\n{details}\n</selected_transaction>\n\n"
+
     questions = [q for q, _a in history] + [question]
     answers = [a for _q, a in history]
-    turns = [("user", f"<capture_data>\n{context}\n</capture_data>\n\nQuestion: {questions[0]}")]
-    for answer, next_question in zip(answers, questions[1:]):
-        turns.append(("assistant", answer))
-        turns.append(("user", f"Question: {next_question}"))
+    texts = [f"Question: {q}" for q in questions]
+    texts[-1] = selected_block + texts[-1]
+    texts[0] = f"<capture_data>\n{context}\n</capture_data>\n\n" + texts[0]
+
+    turns = [("user", texts[0])]
+    for answer, text in zip(answers, texts[1:]):
+        turns += [("assistant", answer), ("user", text)]
     return turns
 
 
